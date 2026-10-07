@@ -23,9 +23,7 @@ curl -s "https://api.github.com/repos/project-lightwell/lightwell-osv/contents/a
     curl -s "$url" | jq -r \
       '[.upstream[]? | select(startswith("CVE-"))] as $cves
        | .id as $id
-       | (.affected | map(select(.package.ecosystem | startswith("Red Hat Lightwell:"))))
-           as $rhlw_entries
-       | (if ($rhlw_entries | length) > 0 then $rhlw_entries else .affected end)[]
+       | .affected[]
        | [
            $id,
            .package.ecosystem,
