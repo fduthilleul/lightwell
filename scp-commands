@@ -1,0 +1,5 @@
+To get the file on the host:
+scp -P port user@IP:/home/path-to-file ~/Downloads/
+
+To push a file to the VM:
+scp /Users/path-to-file user@IP:/home/path-to-directory
