@@ -1,4 +1,4 @@
-# How list-java-packages.sh works
+# How list-java-remediated-packages.sh works
 
 ## Maven repository structure
 
