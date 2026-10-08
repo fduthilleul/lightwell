@@ -73,7 +73,7 @@ sync_github() {
       printf "\r  Downloaded %d files..." "$count"
     done
   echo ""
-  count=$(ls "$GITHUB_DIR"/*.json 2>/dev/null | wc -l)
+  count=$(ls "$GITHUB_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
   echo "  Done: $count files cached."
   save_ts "github"
 }
@@ -95,7 +95,7 @@ sync_pulp_osv() {
         printf "\r  [%s] Downloaded %d files..." "$eco" "$count"
       done
     echo ""
-    count=$(ls "$dir"/*.json 2>/dev/null | wc -l)
+    count=$(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ')
     echo "  [$eco] Done: $count files cached."
   done
   save_ts "pulp_osv"
@@ -139,6 +139,7 @@ def fetch_text(url):
             if attempt == 2: return ""
             import time; time.sleep(1)
     return ""
+
 
 def fetch_entries(url):
     body = fetch_text(url)
