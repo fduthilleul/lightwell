@@ -88,7 +88,7 @@ sync_pulp_osv() {
     local base_url="$PULP_BASE/$eco/remediated"
     local count=0
     curl -sL -u "$_user:$_pass" "$base_url/" \
-    | grep -oP 'x_RHLW-[^"]+\.json' | sort -u \
+    | grep -oE 'x_RHLW-[^"]+\.json' | sort -u \
     | while read -r f; do
         curl -sL -u "$_user:$_pass" "$base_url/$f" -o "$dir/$f"
         count=$((count + 1))
