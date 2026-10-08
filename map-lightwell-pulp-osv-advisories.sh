@@ -102,7 +102,40 @@ else:
         print(row(*r))
 
     print()
-    print(f'Total: {len(rows)} advisory/package mapping(s)')
+
+# Summary (both modes)
+from collections import defaultdict
+
+ECO_LABEL = {'Maven': 'Java', 'PyPI': 'Python'}
+
+# Group rows by ecosystem
+by_eco = defaultdict(list)
+for r in rows:
+    by_eco[r[3]].append(r)
+
+label_w = max(len('OSV files processed:'), len('Unique CVEs fixed:'),
+              len('Unique novel vulns fixed:'), len('Unique packages affected:'),
+              len('Unique versions affected:'))
+
+def summary_line(label, value):
+    return f'  {label:<{label_w}}  {value}'
+
+ecosystems = sorted(by_eco)
+for eco in ecosystems:
+    eco_rows = by_eco[eco]
+    osv_files    = len({r[0] for r in eco_rows})
+    cves         = {c for r in eco_rows for c in r[6].split(',') if c}
+    novel        = {r[1] for r in eco_rows if not r[6]}
+    packages     = {r[4] for r in eco_rows}
+    versions     = {(r[4], r[5]) for r in eco_rows}
+
+    print(ECO_LABEL.get(eco, eco))
+    print(summary_line('OSV files processed:',      osv_files))
+    print(summary_line('Unique CVEs fixed:',         len(cves)))
+    print(summary_line('Unique novel vulns fixed:',  len(novel)))
+    print(summary_line('Unique packages affected:',  len(packages)))
+    print(summary_line('Unique versions affected:',  len(versions)))
+    print()
 "
 } | if [ -n "${_filename:-}" ]; then
     cat > "$_filename"
