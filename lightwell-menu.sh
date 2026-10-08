@@ -26,7 +26,7 @@ print(v)
 " 2>/dev/null
 }
 
-count_files() { ls "$1"/*.json 2>/dev/null | wc -l; }
+count_files() { ls "$1"/*.json 2>/dev/null | wc -l | tr -d ' '; }
 
 cache_ok() {
   local dir="$1"
