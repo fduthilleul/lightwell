@@ -35,7 +35,7 @@ esac
 {
 for BASE_URL in "${ENDPOINTS[@]}"; do
   curl -sL -u "$_user:$_pass" "$BASE_URL/" \
-  | grep -oP 'x_RHLW-[^"]+\.json' | sort -u \
+  | grep -oE 'x_RHLW-[^"]+\.json' | sort -u \
   | while read -r f; do
       curl -sL -u "$_user:$_pass" "$BASE_URL/$f" | jq -r \
         --arg fname "$f" \
