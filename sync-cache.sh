@@ -20,6 +20,7 @@ TS_FILE="$CACHE_DIR/timestamps.json"
 GITHUB_API="https://api.github.com/repos/project-lightwell/lightwell-osv/contents/advisories"
 PULP_BASE="https://packages.redhat.com/api/pulp-content/lightwell/osv"
 MAVEN_BASE="https://packages.redhat.com/lightwell/java/remediated"
+PYTHON_BASE="https://packages.redhat.com/lightwell/python/remediated"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -103,13 +104,12 @@ sync_pulp_osv() {
 
 sync_maven() {
   ensure_creds
-  echo "Syncing Maven repository index (this may take a few minutes)..."
-  export _user _pass MAVEN_BASE MAVEN_INDEX
+  echo "Syncing package repository index — Java + Python (this may take a few minutes)..."
+  export _user _pass MAVEN_BASE PYTHON_BASE MAVEN_INDEX
   python3 -I - <<'PYEOF'
 import os, sys, re, json, urllib.request, urllib.error, base64, threading, queue
 from datetime import datetime, timezone
 
-MAVEN_BASE  = os.environ["MAVEN_BASE"].rstrip("/")
 MAVEN_INDEX = os.environ["MAVEN_INDEX"]
 user        = os.environ["_user"]
 pwd         = os.environ["_pass"]
@@ -120,14 +120,41 @@ headers = {"Authorization": f"Basic {creds}"}
 ENTRY_RE = re.compile(
     r'href="\.?/?([^"?][^"]*)">[^<]*</a>\s+(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})'
 )
-ARTIFACT_CHECKS = [
-    ("jar",                      lambda fs: any(f.endswith(".jar") and "-sources" not in f and "-test-sources" not in f for f in fs)),
-    ("pom",                      lambda fs: any(f.endswith(".pom") for f in fs)),
-    ("sources_jar",              lambda fs: any(f.endswith("-sources.jar") for f in fs)),
-    ("test_sources_jar",         lambda fs: any(f.endswith("-test-sources.jar") for f in fs)),
-    ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
-    ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
-]
+
+CHECKS = {
+    "java": [
+        ("jar",                      lambda fs: any(f.endswith(".jar") and "-sources" not in f and "-test-sources" not in f for f in fs)),
+        ("pom",                      lambda fs: any(f.endswith(".pom") for f in fs)),
+        ("sources_jar",              lambda fs: any(f.endswith("-sources.jar") for f in fs)),
+        ("test_sources_jar",         lambda fs: any(f.endswith("-test-sources.jar") for f in fs)),
+        ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
+        ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
+    ],
+    "python": [
+        ("whl",                      lambda fs: any(f.endswith(".whl") for f in fs)),
+        ("tar_gz",                   lambda fs: any(f.endswith(".tar.gz") for f in fs)),
+        ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
+        ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
+    ],
+}
+
+def is_version_dir(eco, files):
+    if eco == "java":
+        return any(f.endswith(".pom") for f in files)
+    return any(f.endswith(".whl") or f.endswith(".tar.gz") for f in files)
+
+def get_pkg(eco, path):
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        return None, None
+    version  = parts[-1]
+    artifact = parts[-2]
+    if eco == "java":
+        group_id = ".".join(parts[:-2])
+        pkg = f"{group_id}:{artifact}" if group_id else artifact
+    else:
+        pkg = artifact
+    return pkg, version
 
 def fetch_text(url):
     req = urllib.request.Request(url, headers=headers)
@@ -140,71 +167,79 @@ def fetch_text(url):
             import time; time.sleep(1)
     return ""
 
-
 def fetch_entries(url):
     body = fetch_text(url)
     return [(m.group(1).lstrip("./"), m.group(2)) for m in ENTRY_RE.finditer(body)]
 
-# Load prefixes
-prefixes_text = fetch_text(f"{MAVEN_BASE}/.meta/prefixes.txt")
-prefixes = [l.strip().lstrip("/") for l in prefixes_text.splitlines()
-            if l.strip() and not l.startswith("#")]
-sys.stderr.write(f"  Found {len(prefixes)} prefixes\n")
+all_results = []
+lock        = threading.Lock()
+counter     = [0]
 
-work_q  = queue.Queue()
-results = []
-lock    = threading.Lock()
-counter = [0]
+def crawl_eco(eco, base_url):
+    prefixes_text = fetch_text(f"{base_url}/.meta/prefixes.txt")
+    prefixes = [l.strip().lstrip("/") for l in prefixes_text.splitlines()
+                if l.strip() and not l.startswith("#")]
+    if prefixes:
+        sys.stderr.write(f"  [{eco}] Found {len(prefixes)} prefixes\n")
+        seeds = [(p, None) for p in prefixes]
+    else:
+        sys.stderr.write(f"  [{eco}] No prefixes.txt, using root listing\n")
+        root = fetch_entries(f"{base_url}/")
+        seeds = [(n.rstrip("/"), ts) for n, ts in root if n.endswith("/") and not n.startswith(".")]
 
-for p in prefixes:
-    work_q.put((p, None))
+    work_q = queue.Queue()
+    for seed in seeds:
+        work_q.put(seed)
 
-def worker():
-    while True:
-        try:
-            path, entry_ts = work_q.get(timeout=10)
-        except queue.Empty:
-            break
-        try:
-            url     = f"{MAVEN_BASE}/{path.lstrip('/')}/"
-            entries = fetch_entries(url)
-            dirs    = [(n, ts) for n, ts in entries if n.endswith("/") and not n.startswith(".")]
-            files   = [n for n, _ in entries if not n.endswith("/")]
+    def worker():
+        while True:
+            try:
+                path, entry_ts = work_q.get(timeout=10)
+            except queue.Empty:
+                break
+            try:
+                url     = f"{base_url}/{path.lstrip('/')}/"
+                entries = fetch_entries(url)
+                dirs    = [(n, ts) for n, ts in entries if n.endswith("/") and not n.startswith(".")]
+                files   = [n for n, _ in entries if not n.endswith("/")]
+                if is_version_dir(eco, files):
+                    pkg, version = get_pkg(eco, path)
+                    if pkg and version:
+                        art = {k: chk(files) for k, chk in CHECKS[eco]}
+                        with lock:
+                            all_results.append({"ecosystem": eco, "pkg": pkg,
+                                                "version": version, "added": entry_ts or "",
+                                                **art})
+                            counter[0] += 1
+                            if counter[0] % 10 == 0:
+                                sys.stderr.write(f"\r  Indexed {counter[0]} versions...")
+                else:
+                    for dirname, ts in dirs:
+                        work_q.put((path.rstrip("/") + "/" + dirname.rstrip("/"), ts))
+            finally:
+                work_q.task_done()
 
-            if any(f.endswith(".pom") for f in files):
-                parts = path.strip("/").split("/")
-                if len(parts) >= 2:
-                    version  = parts[-1]
-                    artifact = parts[-2]
-                    group_id = ".".join(parts[:-2])
-                    pkg      = f"{group_id}:{artifact}" if group_id else artifact
-                    art      = {k: chk(files) for k, chk in ARTIFACT_CHECKS}
-                    with lock:
-                        results.append({"ecosystem": "java", "pkg": pkg,
-                                        "version": version, "added": entry_ts or "",
-                                        **art})
-                        counter[0] += 1
-                        if counter[0] % 10 == 0:
-                            sys.stderr.write(f"\r  Indexed {counter[0]} versions...")
-            else:
-                for dirname, ts in dirs:
-                    work_q.put((path.rstrip("/") + "/" + dirname.rstrip("/"), ts))
-        finally:
-            work_q.task_done()
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+    for t in threads: t.start()
+    work_q.join()
+    eco_count = sum(1 for r in all_results if r["ecosystem"] == eco)
+    sys.stderr.write(f"\r  [{eco}] Indexed {eco_count} versions.      \n")
 
-threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
-for t in threads: t.start()
-work_q.join()
+BASES = {"java": os.environ["MAVEN_BASE"].rstrip("/"),
+         "python": os.environ["PYTHON_BASE"].rstrip("/")}
+for eco, base_url in BASES.items():
+    crawl_eco(eco, base_url)
 
-sys.stderr.write(f"\r  Indexed {len(results)} versions.      \n")
-
+sys.stderr.write(f"  Total: {len(all_results)} versions indexed.\n")
 output = {
     "synced_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "entries": sorted(results, key=lambda x: (x["pkg"], x["version"]))
+    "entries": sorted(all_results, key=lambda x: (x["ecosystem"], x["pkg"], x["version"]))
 }
 with open(MAVEN_INDEX, "w") as f:
     json.dump(output, f, indent=2)
-print(f"  Maven index saved: {len(results)} versions across {len({e['pkg'] for e in results})} packages.")
+j = sum(1 for e in all_results if e["ecosystem"] == "java")
+p = sum(1 for e in all_results if e["ecosystem"] == "python")
+print(f"  Package index saved: {j} Java + {p} Python versions across {len({e['pkg'] for e in all_results})} packages.")
 PYEOF
   save_ts "maven"
 }
@@ -223,7 +258,7 @@ echo ""
 echo "What would you like to sync?"
 echo "  1) GitHub OSV advisories"
 echo "  2) Pulp OSV advisories (Java + Python)"
-echo "  3) Maven repository index (slow — crawls ~3,400 dirs)"
+echo "  3) Package repository index (slow — crawls Java + Python repos)"
 echo "  4) All"
 echo "  0) Cancel"
 echo ""
