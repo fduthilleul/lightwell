@@ -196,7 +196,8 @@ else:
     print()
     for fam in sorted(eco_data):
         ed = eco_data[fam]
-        print(f'  {fam}: {len(ed[\"advs\"])} advisory/advisories, {len(ed[\"pkgs\"])} unique package(s), {len(ed[\"cves\"])} unique CVE(s)')
+        nadv = len(ed['advs']); npkg = len(ed['pkgs']); ncve = len(ed['cves'])
+        print(f'  {fam}: {nadv} advisory/advisories, {npkg} unique package(s), {ncve} unique CVE(s)')
     all_advs = {a for ed in eco_data.values() for a in ed['advs']}
     all_pkgs = {p for ed in eco_data.values() for p in ed['pkgs']}
     all_cves = {c for ed in eco_data.values() for c in ed['cves']}
@@ -253,11 +254,16 @@ else:
     for eco in sorted(by_eco):
         er=by_eco[eco]
         print(ECO_LABEL.get(eco,eco))
-        print(f'  {\"OSV files processed:\":<{lw}}  {len({r[0] for r in er})}')
-        print(f'  {\"Unique CVEs fixed:\":<{lw}}  {len({c for r in er for c in r[6].split(\",\") if c})}')
-        print(f'  {\"Unique novel vulns fixed:\":<{lw}}  {len({r[1] for r in er if not r[6]})}')
-        print(f'  {\"Unique packages affected:\":<{lw}}  {len({r[4] for r in er})}')
-        print(f'  {\"Unique versions affected:\":<{lw}}  {len({(r[4],r[5]) for r in er})}')
+        n_osv = len({r[0] for r in er})
+        n_cve = len({c for r in er for c in r[6].split(',') if c})
+        n_nov = len({r[1] for r in er if not r[6]})
+        n_pkg = len({r[4] for r in er})
+        n_ver = len({(r[4],r[5]) for r in er})
+        print('  ' + 'OSV files processed:'.ljust(lw)       + '  ' + str(n_osv))
+        print('  ' + 'Unique CVEs fixed:'.ljust(lw)         + '  ' + str(n_cve))
+        print('  ' + 'Unique novel vulns fixed:'.ljust(lw)  + '  ' + str(n_nov))
+        print('  ' + 'Unique packages affected:'.ljust(lw)  + '  ' + str(n_pkg))
+        print('  ' + 'Unique versions affected:'.ljust(lw)  + '  ' + str(n_ver))
         print()
 " | save_output "$csv"
 }
@@ -292,7 +298,7 @@ else:
     print(row('-'*c0,'-'*c1))
     for r in rows: print(row(*r))
     print(f'\n  Total: {len(rows)} package(s), {sum(len(pkg_vers[p]) for p in pkg_vers)} version(s)')
-    print(f'  (index synced: {data[\"synced_at\"]})')
+    print('  (index synced: ' + data['synced_at'] + ')')
 " | save_output "$csv"
 }
 
@@ -309,36 +315,45 @@ output_csv = '$csv' == '1'
 JAVA_COLS   = ['jar','pom','sources_jar','test_sources_jar','cyclonedx_json','provenance_sigstore_json']
 JAVA_HDRS   = ['jar','pom','sources.jar','test-sources.jar','cyclonedx.json','provenance.sigstore.json']
 PYTHON_COLS = ['whl','tar_gz','cyclonedx_json','provenance_sigstore_json']
-PYTHON_HDRS = ['whl','tar.gz','cyclonedx.json','provena
-nce.sigstore.json']
+PYTHON_HDRS = ['whl','tar.gz','cyclonedx.json','provenance.sigstore.json']
 
 def show_section(entries, cols, hdrs, eco_label):
     rows = [(e['pkg'], e['version']) + tuple('X' if e.get(c) else '-' for c in cols)
             for e in sorted(entries, key=lambda x:(x['pkg'],x['version']))]
     if not rows:
-        print(f'  No {eco_label} entries.')
+        print('  No ' + eco_label + ' entries.')
         return
     if output_csv:
         w = csvmod.writer(sys.stdout)
         w.writerow(['Package','Version']+hdrs)
         for r in rows: w.writerow(r)
     else:
-        print(f'  {eco_label}')
-        c0=max(len('Package'), max(len(r[0]) for r in rows))
-        c1=max(len('Version'), max(len(r[1]) for r in rows))
-        cw=[max(len(h),1) for h in hdrs]
-        header = f'  {\"Package\":<{c0}}  {\"Version\":<{c1}}' + ''.join(f'  {h:^{w}}' for h,w in zip(hdrs,cw))
-        sep    = f'  {\"-\"*c0}  {\"-\"*c1}' + ''.join(f'  {\"-\"*w}' for w in cw)
-        print(header); print(sep)
+        print('  ' + eco_label)
+        c0 = max(len('Package'), max(len(r[0]) for r in rows))
+        c1 = max(len('Version'), max(len(r[1]) for r in rows))
+        cw = [max(len(h), 1) for h in hdrs]
+        header = '  ' + 'Package'.ljust(c0) + '  ' + 'Version'.ljust(c1)
+        for h, w in zip(hdrs, cw):
+            header += '  ' + h.center(w)
+        sep = '  ' + '-'*c0 + '  ' + '-'*c1
+        for w in cw:
+            sep += '  ' + '-'*w
+        print(header)
+        print(sep)
         for r in rows:
-            print(f'  {r[0]:<{c0}}  {r[1]:<{c1}}'+''.join(f'  {v:^{w}}' for v,w in zip(r[2:],cw)))
-        print(f'\n  Total: {len(rows)} version(s)')
-        print(f'  Missing artifacts by category:')
+            line = '  ' + r[0].ljust(c0) + '  ' + r[1].ljust(c1)
+            for v, w in zip(r[2:], cw):
+                line += '  ' + v.center(w)
+            print(line)
+        print()
+        print('  Total: ' + str(len(rows)) + ' version(s)')
+        print('  Missing artifacts by category:')
         for i, h in enumerate(hdrs):
             missing = sum(1 for r in rows if r[2+i] == '-')
             lbl = h + ':'
-            print(f'    {lbl:<28}  {missing}')
+            print('    ' + lbl.ljust(28) + '  ' + str(missing))
         print()
+
 
 all_entries = data['entries']
 if eco in ('java', 'both'):
