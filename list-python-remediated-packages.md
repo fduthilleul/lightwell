@@ -2,25 +2,29 @@
 
 ## Python repository structure
 
-The Lightwell Python repository at `https://packages.redhat.com/lightwell/python/remediated/`
-follows a simple hierarchical layout. Every package lives at a path of the form:
+The Lightwell Python repository exposes a **PyPI Simple API** (PEP 503), not
+an Apache directory listing. There are three relevant endpoints:
 
+| Endpoint | Returns | Purpose |
+|---|---|---|
+| `/lightwell/python/remediated/` | JSON `{"projects":N,"releases":N,"files":N}` | Pulp summary — not for crawling |
+| `/lightwell/python/remediated/simple/` | HTML with package links | Index of all packages |
+| `/lightwell/python/remediated/simple/{pkg}/` | HTML with file links + metadata | All files for a package |
+
+The actual files are served from a different base:
 ```
-{package-name}/{version}/{artifacts}
+https://packages.redhat.com/api/pulp-content/lightwell/python/remediated/
 ```
 
-Unlike the Java Maven layout there is no `groupId` — the package name maps directly
-to a single directory level.
+**Current state (Oct 2026):** 1 package — **PyPDF2 3.0.1+rhlw.1**.
 
-**Example — `requests` version `2.31.0.rhlw-00001`:**
+**Example — Simple index page for `pypdf2`:**
 
-```
-requests/
-  2.31.0.rhlw-00001/
-    requests-2.31.0.rhlw-00001-py3-none-any.whl
-    requests-2.31.0.rhlw-00001.tar.gz
-    requests-2.31.0.rhlw-00001.cyclonedx.json
-    requests-2.31.0.rhlw-00001.provenance.sigstore.json
+```html
+<a href="https://packages.redhat.com/api/pulp-content/lightwell/python/remediated/pypdf2-3.0.1+rhlw.1.tar.gz#sha256=..."
+   data-provenance="...">pypdf2-3.0.1+rhlw.1.tar.gz</a>
+<a href="https://packages.redhat.com/api/pulp-content/lightwell/python/remediated/pypdf2-3.0.1+rhlw.1-1-py3-none-any.whl#sha256=..."
+   data-provenance="...">pypdf2-3.0.1+rhlw.1-1-py3-none-any.whl</a>
 ```
 
 ### Expected artifact types
@@ -29,82 +33,84 @@ requests/
 |---|---|
 | `*.whl` | Wheel — binary distribution, installable with `pip` |
 | `*.tar.gz` | Source distribution (sdist) |
-| `*cyclonedx.json` | CycloneDX software bill of materials (SBOM) |
-| `*.provenance.sigstore.json` | Sigstore provenance attestation |
+
+Provenance is linked via the `data-provenance` HTML attribute on each file link;
+it is not a standalone file in the same listing.
 
 ---
 
 ## How the crawl works
 
-### Entry point — prefix catalog
+The Python crawl uses the **PyPI Simple API**, not directory listing parsing.
 
-The repository exposes a prefix catalog at `.meta/prefixes.txt`:
-
-```
-https://packages.redhat.com/lightwell/python/remediated/.meta/prefixes.txt
-```
-
-Each non-comment line is a path prefix pointing directly at a package-name
-directory. If the file is present the crawler uses it as seeds to avoid
-fetching the root listing and all its entries one by one.
-
-If no `prefixes.txt` is found, the crawler falls back to the root listing.
-
-### Detection logic
-
-A directory is treated as a **version directory** when it contains at least one
-`.whl` or `.tar.gz` file. The package identity is derived from the path:
+### Step 1 — Fetch the Simple index
 
 ```
-path segments:  [ "requests", "2.31.0.rhlw-00001" ]
-                   ↑ last-2 = package name   ↑ last = version
-package = segments[-2]   → "requests"
-version = segments[-1]   → "2.31.0.rhlw-00001"
+GET /lightwell/python/remediated/simple/
 ```
 
-Because Python packages have no `groupId`, the package name is a single
-segment (unlike Java where all segments except the last two are joined to form
-the groupId).
+Parse all `<a href="...">` links to get the list of package names.
 
-### Parallelism
+### Step 2 — Fetch per-package file list
 
-8 worker threads crawl directories concurrently. Recursion within each thread
-is sequential to avoid nested thread-pool deadlocks.
+For each package:
+```
+GET /lightwell/python/remediated/simple/{pkg}/
+```
+
+Parse `<a href="...">filename</a>` to get the list of files.
+
+### Step 3 — Extract version from filename
+
+| File type | Format | Version extraction |
+|---|---|---|
+| Wheel | `{name}-{version}(-{build})?-{python}-{abi}-{platform}.whl` | 2nd `-`-delimited segment |
+| Source dist | `{name}-{version}.tar.gz` | Everything after first `-`, strip `.tar.gz` |
+
+Example: `pypdf2-3.0.1+rhlw.1-1-py3-none-any.whl` → version `3.0.1+rhlw.1`
+
+### Step 4 — Get timestamp
+
+The Simple index does not include timestamps. A `HEAD` request is made to
+the first file URL for each version to retrieve the `Last-Modified` HTTP header,
+which is then used as the `added` timestamp.
+
+> The Java repository at `/lightwell/java/remediated/.meta/prefixes.txt`
+> provides a prefix catalog (37 entries). No equivalent exists for Python —
+> the Simple index serves the same purpose.
 
 ---
 
 ## Manual verification steps
 
-### 1 — Inspect the prefix catalog
-
-```bash
-curl -sL -u "$_user:$_pass" \
-  'https://packages.redhat.com/lightwell/python/remediated/.meta/prefixes.txt'
-```
-
-### 2 — List available packages (root)
+### 1 — Pulp summary (project/release/file counts)
 
 ```bash
 curl -sL -u "$_user:$_pass" \
   'https://packages.redhat.com/lightwell/python/remediated/'
 ```
 
-### 3 — List versions for a package
+### 2 — Simple index (list of packages)
 
 ```bash
 curl -sL -u "$_user:$_pass" \
-  'https://packages.redhat.com/lightwell/python/remediated/requests/'
+  'https://packages.redhat.com/lightwell/python/remediated/simple/'
 ```
 
-### 4 — Inspect a version directory
+### 3 — File list for a specific package
 
 ```bash
 curl -sL -u "$_user:$_pass" \
-  'https://packages.redhat.com/lightwell/python/remediated/requests/2.31.0.rhlw-00001/'
+  'https://packages.redhat.com/lightwell/python/remediated/simple/pypdf2/'
 ```
 
-Expected: `.whl`, `.tar.gz`, and optionally `cyclonedx.json` and
-`provenance.sigstore.json` files.
+### 4 — Get timestamp for a file (Last-Modified header)
+
+```bash
+curl -sIL -u "$_user:$_pass" \
+  'https://packages.redhat.com/api/pulp-content/lightwell/python/remediated/pypdf2-3.0.1+rhlw.1.tar.gz' \
+| grep -i last-modified
+```
 
 ---
 
@@ -137,8 +143,9 @@ artifact types for each Python package version:
 
 | Aspect | Java | Python |
 |---|---|---|
-| Layout | Maven 2 (`groupId/artifactId/version/`) | Simple (`package-name/version/`) |
+| Repository API | Apache directory listing | PyPI Simple API (PEP 503) |
 | Package ID | `groupId:artifactId` | package name only |
-| Version detection | Directory contains `.pom` file | Directory contains `.whl` or `.tar.gz` |
-| Artifact types | jar, pom, sources.jar, test-sources.jar, cyclonedx.json, provenance.sigstore.json | whl, tar.gz, cyclonedx.json, provenance.sigstore.json |
-| Prefix catalog | Yes (`.meta/prefixes.txt`) | Yes (`.meta/prefixes.txt`) |
+| Version discovery | Directory containing `.pom` file | Filename parsed from Simple index |
+| Timestamp source | Directory listing timestamp | `Last-Modified` HTTP header on file |
+| Artifact types | jar, pom, sources.jar, test-sources.jar, cyclonedx.json, provenance.sigstore.json | whl, tar.gz |
+| Entry point | `.meta/prefixes.txt` (37 entries) | `/simple/` index |
