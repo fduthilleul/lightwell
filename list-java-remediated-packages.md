@@ -1,4 +1,4 @@
-# How list-java-remediated-packages.sh works
+# How list-java-packages.sh works
 
 ## Maven repository structure
 
@@ -37,6 +37,8 @@ commons-io/
 
 ## How the script crawls the tree
 
+### Approach 1 — Root listing (`list-java-remediated-packages.sh`)
+
 1. **Start at the root** — fetches the HTML directory listing of the base URL.
 2. **Recurse into every subdirectory** — follows all `href` links that end with `/`
    (skipping `../` and query strings).
@@ -56,6 +58,54 @@ commons-io/
 
 5. **Parallelism** — 8 threads fetch directory listings concurrently to keep the
    crawl fast despite the depth of the tree.
+
+---
+
+### Approach 2 — Prefix catalog (`list-java-remediated-packages-prefixes.sh`)
+
+Maven repositories can publish a **prefix catalog** at `.meta/prefixes.txt` that
+lists the known group-ID path prefixes. Pulp exposes this file at:
+
+```
+https://packages.redhat.com/lightwell/java/remediated/.meta/prefixes.txt
+```
+
+#### Format
+
+```
+## repository-prefixes/2.0
+/ch/qos
+/com/fasterxml
+/com/google
+/commons-io
+/org/apache
+...
+```
+
+Each line is a path prefix (relative to the repository root, starting with `/`)
+that is guaranteed to contain at least one artifact. Lines starting with `#` are
+comments.
+
+#### Why it helps
+
+Instead of crawling the entire tree from the root (which means fetching many
+intermediate directories that may contain dozens of sub-directories), the script
+can **jump directly** to each known prefix and only recurse from there. With
+37 prefixes covering the full repository, this reduces the number of HTTP
+requests significantly and makes the crawl much faster.
+
+#### How the script uses it
+
+1. **Fetch `.meta/prefixes.txt`** and parse all non-comment lines.
+2. **Enqueue each prefix as a crawl seed** — e.g. `/ch/qos`, `/com/fasterxml`.
+3. **One thread per prefix** crawls sequentially under that prefix (sequential
+   within the thread avoids nested thread-pool deadlocks while still parallelising
+   across prefixes).
+4. **Version detection and package identity** are identical to Approach 1 once
+   a seed directory is entered.
+
+Use both scripts and compare their totals to validate that the prefix catalog is
+complete and no packages are missed.
 
 ---
 
@@ -93,10 +143,20 @@ curl -sL -u "$_user:$_pass" \
 ```bash
 curl -sL -u "$_user:$_pass" \
   'https://packages.redhat.com/lightwell/java/remediated/' \
-| grep -oP 'href="\./[^"]+/"' | grep -v '\.meta'
+| grep -oE 'href="\./[^"]+/"' | grep -v '\.meta'
 ```
 
 These are the root group-ID path segments (`ch/`, `com/`, `org/`, etc.).
+
+### 5 — Inspect the prefix catalog
+
+```bash
+curl -sL -u "$_user:$_pass" \
+  'https://packages.redhat.com/lightwell/java/remediated/.meta/prefixes.txt'
+```
+
+Each non-comment line is a path prefix that the prefixes-based script uses as a
+crawl entry point instead of starting from the root.
 
 ---
 
