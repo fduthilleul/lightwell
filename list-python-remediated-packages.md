@@ -16,8 +16,6 @@ The actual files are served from a different base:
 https://packages.redhat.com/api/pulp-content/lightwell/python/remediated/
 ```
 
-**Current state (Oct 2026):** 1 package — **PyPDF2 3.0.1+rhlw.1**.
-
 **Example — Simple index page for `pypdf2`:**
 
 ```html
