@@ -1,4 +1,5 @@
 # Lightwell Scripts
+![Lightwell scripts menu](screenshots/menu.jpg)
 
 ## Standalone scripts
 
