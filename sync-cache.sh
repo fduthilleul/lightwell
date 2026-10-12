@@ -3,10 +3,11 @@
 # Cache location: ~/.lightwell/cache/
 #
 # Sources cached:
-#   1) GitHub OSV advisories  → github-advisories/*.json
-#   2) Pulp OSV advisories    → pulp-java-advisories/*.json
-#                               pulp-python-advisories/*.json
-#   3) Maven repository index → maven-index.json  (crawl results)
+#   1) GitHub OSV advisories       → github-advisories/*.json
+#   2) Pulp OSV advisories         → pulp-java-advisories/*.json
+#                                    pulp-python-advisories/*.json
+#   3) Maven repository index      → maven-index.json  (crawl results)
+#   4) Chainguard Athena advisories → chainguard-advisories/*.json
 
 set -euo pipefail
 
@@ -14,10 +15,12 @@ CACHE_DIR="${LIGHTWELL_CACHE:-$HOME/.lightwell/cache}"
 GITHUB_DIR="$CACHE_DIR/github-advisories"
 PULP_JAVA_DIR="$CACHE_DIR/pulp-java-advisories"
 PULP_PYTHON_DIR="$CACHE_DIR/pulp-python-advisories"
+CHAINGUARD_DIR="$CACHE_DIR/chainguard-advisories"
 MAVEN_INDEX="$CACHE_DIR/maven-index.json"
 TS_FILE="$CACHE_DIR/timestamps.json"
 
 GITHUB_API="https://api.github.com/repos/project-lightwell/lightwell-osv/contents/advisories"
+CHAINGUARD_API="https://api.github.com/repos/chainguard-dev/athena/contents/advisories"
 PULP_BASE="https://packages.redhat.com/api/pulp-content/lightwell/osv"
 MAVEN_BASE="https://packages.redhat.com/lightwell/java/remediated"
 PYTHON_BASE="https://packages.redhat.com/lightwell/python/remediated"
@@ -117,44 +120,19 @@ pwd         = os.environ["_pass"]
 creds   = base64.b64encode(f"{user}:{pwd}".encode()).decode()
 headers = {"Authorization": f"Basic {creds}"}
 
+# ── Java: Apache directory listing helpers ────────────────────────────────────
+
 ENTRY_RE = re.compile(
     r'href="\.?/?([^"?][^"]*)">[^<]*</a>\s+(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})'
 )
-
-CHECKS = {
-    "java": [
-        ("jar",                      lambda fs: any(f.endswith(".jar") and "-sources" not in f and "-test-sources" not in f for f in fs)),
-        ("pom",                      lambda fs: any(f.endswith(".pom") for f in fs)),
-        ("sources_jar",              lambda fs: any(f.endswith("-sources.jar") for f in fs)),
-        ("test_sources_jar",         lambda fs: any(f.endswith("-test-sources.jar") for f in fs)),
-        ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
-        ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
-    ],
-    "python": [
-        ("whl",                      lambda fs: any(f.endswith(".whl") for f in fs)),
-        ("tar_gz",                   lambda fs: any(f.endswith(".tar.gz") for f in fs)),
-        ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
-        ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
-    ],
-}
-
-def is_version_dir(eco, files):
-    if eco == "java":
-        return any(f.endswith(".pom") for f in files)
-    return any(f.endswith(".whl") or f.endswith(".tar.gz") for f in files)
-
-def get_pkg(eco, path):
-    parts = path.strip("/").split("/")
-    if len(parts) < 2:
-        return None, None
-    version  = parts[-1]
-    artifact = parts[-2]
-    if eco == "java":
-        group_id = ".".join(parts[:-2])
-        pkg = f"{group_id}:{artifact}" if group_id else artifact
-    else:
-        pkg = artifact
-    return pkg, version
+JAVA_CHECKS = [
+    ("jar",                      lambda fs: any(f.endswith(".jar") and "-sources" not in f and "-test-sources" not in f for f in fs)),
+    ("pom",                      lambda fs: any(f.endswith(".pom") for f in fs)),
+    ("sources_jar",              lambda fs: any(f.endswith("-sources.jar") for f in fs)),
+    ("test_sources_jar",         lambda fs: any(f.endswith("-test-sources.jar") for f in fs)),
+    ("cyclonedx_json",           lambda fs: any("cyclonedx.json" in f for f in fs)),
+    ("provenance_sigstore_json", lambda fs: any(f.endswith(".provenance.sigstore.json") for f in fs)),
+]
 
 def fetch_text(url):
     req = urllib.request.Request(url, headers=headers)
@@ -167,23 +145,33 @@ def fetch_text(url):
             import time; time.sleep(1)
     return ""
 
+def fetch_header(url, header):
+    req = urllib.request.Request(url, method="HEAD", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.headers.get(header, "")
+    except Exception:
+        return ""
+
 def fetch_entries(url):
     body = fetch_text(url)
     return [(m.group(1).lstrip("./"), m.group(2)) for m in ENTRY_RE.finditer(body)]
+
+# ── Java crawl: directory listing ─────────────────────────────────────────────
 
 all_results = []
 lock        = threading.Lock()
 counter     = [0]
 
-def crawl_eco(eco, base_url):
+def crawl_java(base_url):
     prefixes_text = fetch_text(f"{base_url}/.meta/prefixes.txt")
     prefixes = [l.strip().lstrip("/") for l in prefixes_text.splitlines()
                 if l.strip() and not l.startswith("#")]
     if prefixes:
-        sys.stderr.write(f"  [{eco}] Found {len(prefixes)} prefixes\n")
+        sys.stderr.write(f"  [java] Found {len(prefixes)} prefixes\n")
         seeds = [(p, None) for p in prefixes]
     else:
-        sys.stderr.write(f"  [{eco}] No prefixes.txt, using root listing\n")
+        sys.stderr.write("  [java] No prefixes.txt, using root listing\n")
         root = fetch_entries(f"{base_url}/")
         seeds = [(n.rstrip("/"), ts) for n, ts in root if n.endswith("/") and not n.startswith(".")]
 
@@ -202,12 +190,16 @@ def crawl_eco(eco, base_url):
                 entries = fetch_entries(url)
                 dirs    = [(n, ts) for n, ts in entries if n.endswith("/") and not n.startswith(".")]
                 files   = [n for n, _ in entries if not n.endswith("/")]
-                if is_version_dir(eco, files):
-                    pkg, version = get_pkg(eco, path)
-                    if pkg and version:
-                        art = {k: chk(files) for k, chk in CHECKS[eco]}
+                if any(f.endswith(".pom") for f in files):
+                    parts = path.strip("/").split("/")
+                    if len(parts) >= 2:
+                        version  = parts[-1]
+                        artifact = parts[-2]
+                        group_id = ".".join(parts[:-2])
+                        pkg      = f"{group_id}:{artifact}" if group_id else artifact
+                        art      = {k: chk(files) for k, chk in JAVA_CHECKS}
                         with lock:
-                            all_results.append({"ecosystem": eco, "pkg": pkg,
+                            all_results.append({"ecosystem": "java", "pkg": pkg,
                                                 "version": version, "added": entry_ts or "",
                                                 **art})
                             counter[0] += 1
@@ -222,13 +214,79 @@ def crawl_eco(eco, base_url):
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
     for t in threads: t.start()
     work_q.join()
-    eco_count = sum(1 for r in all_results if r["ecosystem"] == eco)
-    sys.stderr.write(f"\r  [{eco}] Indexed {eco_count} versions.      \n")
+    eco_count = sum(1 for r in all_results if r["ecosystem"] == "java")
+    sys.stderr.write(f"\r  [java] Indexed {eco_count} versions.      \n")
 
-BASES = {"java": os.environ["MAVEN_BASE"].rstrip("/"),
-         "python": os.environ["PYTHON_BASE"].rstrip("/")}
-for eco, base_url in BASES.items():
-    crawl_eco(eco, base_url)
+# ── Python crawl: PyPI Simple API (PEP 503) ───────────────────────────────────
+
+PKG_LINK_RE  = re.compile(r'href="([^"]+)"[^>]*>([^<]+)</a>')
+FILE_LINK_RE = re.compile(r'href="([^#"]+)(?:#[^"]+)?"[^>]*>([^<]+)</a>')
+LM_FMT = "%a, %d %b %Y %H:%M:%S %Z"
+TS_FMT = "%d-%b-%Y %H:%M"
+
+def last_modified_to_ts(lm_str):
+    try:
+        dt = datetime.strptime(lm_str.strip(), LM_FMT)
+        return dt.strftime(TS_FMT)
+    except Exception:
+        return ""
+
+def extract_version(pkg_name, filename):
+    norm = re.sub(r"[-_.]+", "_", pkg_name.lower())
+    if filename.endswith(".whl"):
+        parts = filename[:-4].split("-")
+        return parts[1] if len(parts) >= 2 else None
+    if filename.endswith(".tar.gz"):
+        base = filename[:-7]
+        idx  = base.find("-")
+        return base[idx+1:] if idx >= 0 else None
+    return None
+
+def crawl_python(base_url):
+    simple_url = base_url.rstrip("/") + "/simple/"
+    sys.stderr.write(f"  [python] Fetching Simple index from {simple_url}\n")
+    body = fetch_text(simple_url)
+    packages = [(m.group(2).strip().lower(), m.group(1).rstrip("/"))
+                for m in PKG_LINK_RE.finditer(body)
+                if not m.group(1).startswith("http")]
+    sys.stderr.write(f"  [python] Found {len(packages)} package(s)\n")
+
+    for pkg_name, pkg_href in packages:
+        pkg_url  = simple_url + pkg_href + "/"
+        pkg_body = fetch_text(pkg_url)
+        version_files = {}
+        first_url = {}
+        for m in FILE_LINK_RE.finditer(pkg_body):
+            file_url  = m.group(1)
+            fname     = m.group(2).strip()
+            version   = extract_version(pkg_name, fname)
+            if not version:
+                continue
+            if version not in version_files:
+                version_files[version] = []
+                first_url[version]     = file_url.split("#")[0]
+            version_files[version].append(fname)
+
+        for version, fnames in version_files.items():
+            lm = fetch_header(first_url[version], "Last-Modified")
+            added = last_modified_to_ts(lm)
+            with lock:
+                all_results.append({
+                    "ecosystem": "python",
+                    "pkg":       pkg_name,
+                    "version":   version,
+                    "added":     added,
+                    "whl":                      any(f.endswith(".whl")                      for f in fnames),
+                    "tar_gz":                   any(f.endswith(".tar.gz")                   for f in fnames),
+                    "cyclonedx_json":           any("cyclonedx.json"           in f         for f in fnames),
+                    "provenance_sigstore_json": any(f.endswith(".provenance.sigstore.json") for f in fnames),
+                })
+                counter[0] += 1
+    eco_count = sum(1 for r in all_results if r["ecosystem"] == "python")
+    sys.stderr.write(f"  [python] Indexed {eco_count} version(s).\n")
+
+crawl_java(os.environ["MAVEN_BASE"].rstrip("/"))
+crawl_python(os.environ["PYTHON_BASE"].rstrip("/"))
 
 sys.stderr.write(f"  Total: {len(all_results)} versions indexed.\n")
 output = {
@@ -244,22 +302,57 @@ PYEOF
   save_ts "maven"
 }
 
+sync_chainguard() {
+  echo "Syncing Chainguard Athena advisories..."
+  mkdir -p "$CHAINGUARD_DIR"
+  local count=0
+  curl -s -H "Accept: application/vnd.github.v3+json" \
+       -H "User-Agent: lightwell-sync" \
+       "$CHAINGUARD_API" \
+  | jq -r '.[] | select(.type=="dir") | .url' \
+  | while read -r dir_url; do
+      json_url=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+                      -H "User-Agent: lightwell-sync" \
+                      "$dir_url" \
+                 | jq -r '.[] | select(.name | endswith(".json")) | .download_url')
+      if [[ -n "$json_url" ]]; then
+        fname=$(basename "$json_url")
+        curl -s "$json_url" -o "$CHAINGUARD_DIR/$fname"
+        count=$((count + 1))
+        printf "\r  Downloaded %d files..." "$count"
+      fi
+    done
+  echo ""
+  count=$(ls "$CHAINGUARD_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  echo "  Done: $count files cached."
+  save_ts "chainguard"
+}
+
 # ── Menu ──────────────────────────────────────────────────────────────────────
+
+# Sync VM clock before recording any timestamps
+if sudo chronyc makestep &>/dev/null; then
+  echo "  Clock synced (chronyc makestep OK — $(date '+%Y-%m-%d %H:%M:%S %Z'))"
+else
+  echo "  Warning: clock sync failed (chronyc makestep). Timestamps may be off." >&2
+fi
 
 echo ""
 echo "Lightwell Cache Sync"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Cache location: $CACHE_DIR"
 echo ""
-echo "  GitHub OSV last sync : $(read_ts github)"
-echo "  Pulp OSV  last sync  : $(read_ts pulp_osv)"
-echo "  Maven index last sync: $(read_ts maven)"
+echo "  GitHub OSV last sync     : $(read_ts github)"
+echo "  Pulp OSV last sync       : $(read_ts pulp_osv)"
+echo "  Maven index last sync    : $(read_ts maven)"
+echo "  Chainguard Athena last sync: $(read_ts chainguard)"
 echo ""
 echo "What would you like to sync?"
-echo "  1) GitHub OSV advisories"
-echo "  2) Pulp OSV advisories (Java + Python)"
-echo "  3) Package repository index (slow — crawls Java + Python repos)"
-echo "  4) All"
+echo "  1) GitHub OSV advisories         (Lightwell)"
+echo "  2) Pulp OSV advisories           (Lightwell Java + Python)"
+echo "  3) Package repository index      (slow — crawls Java + Python repos)"
+echo "  4) Chainguard Athena advisories  (live from GitHub)"
+echo "  5) All"
 echo "  0) Cancel"
 echo ""
 read -rp "Choice: " _choice
@@ -268,7 +361,8 @@ case "$_choice" in
   1) sync_github ;;
   2) sync_pulp_osv ;;
   3) sync_maven ;;
-  4) sync_github; sync_pulp_osv; sync_maven ;;
+  4) sync_chainguard ;;
+  5) sync_github; sync_pulp_osv; sync_maven; sync_chainguard ;;
   0) echo "Cancelled." ;;
   *) echo "Invalid choice." >&2; exit 1 ;;
 esac
