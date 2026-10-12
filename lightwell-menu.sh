@@ -8,6 +8,7 @@ CACHE_DIR="${LIGHTWELL_CACHE:-$HOME/.lightwell/cache}"
 GITHUB_DIR="$CACHE_DIR/github-advisories"
 PULP_JAVA_DIR="$CACHE_DIR/pulp-java-advisories"
 PULP_PYTHON_DIR="$CACHE_DIR/pulp-python-advisories"
+CHAINGUARD_DIR="$CACHE_DIR/chainguard-advisories"
 MAVEN_INDEX="$CACHE_DIR/maven-index.json"
 TS_FILE="$CACHE_DIR/timestamps.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,8 +47,21 @@ require_cache() {
 }
 
 ask_csv() {
-  read -rp "Output as CSV? [y/N] " _ans
+  read -rp "Output as CSV? [y/N] " _ans < /dev/tty
   case "$_ans" in [yY]*) echo 1 ;; *) echo 0 ;; esac
+}
+
+ask_provider() {
+  echo "Provider:" >&2
+  echo "  1) Lightwell" >&2
+  echo "  2) Chainguard Athena" >&2
+  echo "  3) Both" >&2
+  read -rp "Choice [1=Lightwell / 2=Chainguard / 3=Both]: " _pr < /dev/tty >&2
+  case "$_pr" in
+    1) echo "lightwell" ;;
+    2) echo "chainguard" ;;
+    *) echo "both" ;;
+  esac
 }
 
 ask_ecosystem() {
@@ -66,7 +80,7 @@ ask_ecosystem() {
 save_output() {
   local csv="$1"
   if [[ "$csv" == "1" ]]; then
-    read -rp "Save to file? (leave empty for stdout): " _fn
+    read -rp "Save to file? (leave empty for stdout): " _fn < /dev/tty
     if [[ -n "$_fn" ]]; then
       cat > "$_fn" && echo "Saved to $_fn" >&2
     else cat; fi
@@ -76,11 +90,162 @@ save_output() {
 # ── Queries ───────────────────────────────────────────────────────────────────
 
 q_count_github() {
-  require_cache "cache_ok '$GITHUB_DIR'" "GitHub OSV" || return
-  local n; n=$(count_files "$GITHUB_DIR")
-  echo ""
-  echo "  GitHub OSV advisory files in cache: $n"
-  echo ""
+  python3 -I -c "
+import json, glob, os, urllib.request
+from collections import Counter, defaultdict
+
+GITHUB_DIR  = '$GITHUB_DIR'
+PULP_DIRS   = ['$PULP_JAVA_DIR', '$PULP_PYTHON_DIR']
+CG_DIR      = '$CHAINGUARD_DIR'
+TOKEN       = os.environ.get('TOKEN', '')
+
+def eco_label(eco_str):
+    s = eco_str.lower()
+    if 'maven' in s: return 'Java'
+    if 'pypi'  in s or 'python' in s: return 'Python'
+    return 'Unknown'
+
+# ── Helper: count per-ecosystem from local cache files ────────────────────────
+# Returns {eco: (advisories, schema, cves, unique_pkgs, unique_vers)}
+
+def count_from_files(dirs):
+    files = []
+    for d in dirs:
+        files += glob.glob(d + '/*.json')
+    if not files:
+        return None  # not synced
+    eco_counts  = defaultdict(int)
+    eco_schemas = defaultdict(Counter)
+    eco_cves    = defaultdict(set)
+    eco_pkgs    = defaultdict(set)
+    eco_fixvers = defaultdict(set)
+    for f in sorted(files):
+        try:
+            d = json.load(open(f))
+        except: continue
+        schema   = d.get('schema_version', 'unknown')
+        all_cves = {c for c in d.get('upstream', []) + d.get('aliases', []) if c.startswith('CVE-')}
+        ecos     = {eco_label(a.get('package', {}).get('ecosystem', ''))
+                    for a in d.get('affected', [])}
+        if not ecos: ecos = {'Unknown'}
+        for eco in ecos:
+            eco_counts[eco] += 1
+            eco_schemas[eco][schema] += 1
+            eco_cves[eco].update(all_cves)
+        for a in d.get('affected', []):
+            eco = eco_label(a.get('package', {}).get('ecosystem', ''))
+            pkg = a.get('package', {}).get('name', '')
+            if pkg:
+                eco_pkgs[eco].add(pkg)
+            for r in a.get('ranges', []):
+                for e in r.get('events', []):
+                    if 'fixed' in e and pkg:
+                        eco_fixvers[eco].add((pkg, e['fixed']))
+            rem = a.get('database_specific', {}).get('lightwell', {}).get('remediated_version', '')
+            if rem and pkg:
+                eco_fixvers[eco].add((pkg, rem))
+    return {eco: (str(eco_counts[eco]),
+                  ', '.join(sorted(eco_schemas[eco].keys())),
+                  str(len(eco_cves[eco])),
+                  str(len(eco_pkgs[eco])),
+                  str(len(eco_fixvers[eco])))
+            for eco in eco_counts}
+
+# ── Helper: count per-ecosystem from Lightwell REST API ──────────────────────
+# API provides package_name + fixed_versions per advisory — fully supported.
+# Returns {eco: (advisories, schema, cves, unique_pkgs, unique_vers)}
+
+def count_from_api(token):
+    if not token:
+        return {'(no token)': ('n/a', 'n/a', 'n/a', 'n/a', 'n/a')}
+    BASE    = 'https://console.redhat.com/api/lightwell/v0.1/advisories'
+    headers = {'Authorization': f'Bearer {token}'}
+    eco_counts  = defaultdict(int)
+    eco_schemas = defaultdict(Counter)
+    eco_cves    = defaultdict(set)
+    eco_pkgs    = defaultdict(set)
+    eco_fixvers = defaultdict(set)
+    limit, offset, total = 100, 0, None
+    while True:
+        req = urllib.request.Request(f'{BASE}?limit={limit}&offset={offset}', headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+        except Exception as e:
+            return {'(error)': (str(e)[:20], 'n/a', 'n/a', 'n/a', 'n/a')}
+        if total is None:
+            total = d['meta']['count']
+        for a in d['data']:
+            repo   = a.get('repository', '')
+            eco    = 'Java' if 'java' in repo else 'Python' if 'python' in repo else 'Unknown'
+            schema = a.get('schema_version', 'unknown')
+            eco_counts[eco] += 1
+            eco_schemas[eco][schema] += 1
+            for c in a.get('upstream', []) + a.get('aliases', []):
+                if c.startswith('CVE-'):
+                    eco_cves[eco].add(c)
+            pkg = a.get('package_name', '')
+            if pkg:
+                eco_pkgs[eco].add(pkg)
+                for ver in a.get('fixed_versions', []):
+                    eco_fixvers[eco].add((pkg, ver))
+        offset += limit
+        if offset >= total:
+            break
+    return {eco: (str(eco_counts[eco]),
+                  ', '.join(sorted(eco_schemas[eco].keys())),
+                  str(len(eco_cves[eco])),
+                  str(len(eco_pkgs[eco])),
+                  str(len(eco_fixvers[eco])))
+            for eco in eco_counts}
+
+# ── Build flat rows (one per source × ecosystem) ──────────────────────────────
+
+SOURCES = [
+    ('Public Lightwell OSV (GitHub)',      count_from_files([GITHUB_DIR]), 'https://github.com/project-lightwell/lightwell-osv'),
+    ('Pulp OSV (packages.redhat.com)',     count_from_files(PULP_DIRS),   'https://packages.redhat.com/api/pulp-content/lightwell/osv/'),
+    ('Lightwell API (console.redhat.com)', count_from_api(TOKEN),         'https://console.redhat.com/api/lightwell/v0.1/advisories'),
+    ('Chainguard Athena (GitHub)',         count_from_files([CG_DIR]),    'https://github.com/chainguard-dev/athena'),
+]
+
+# flat row: (source, ecosystem, advisories, schema, cves, unique_pkgs, unique_vers, url)
+flat = []
+for src, eco_data, url in SOURCES:
+    if eco_data is None:
+        flat.append((src, 'n/a', 'not synced', 'n/a', 'n/a', 'n/a', 'n/a', url))
+        continue
+    for eco in ['Java', 'Python']:
+        if eco in eco_data:
+            cnt, schema, cves, pkgs, vers = eco_data[eco]
+        else:
+            cnt, schema, cves, pkgs, vers = '0', 'n/a', '0', '0', '0'
+        flat.append((src, eco, cnt, schema, cves, pkgs, vers, url))
+    for eco, vals in eco_data.items():
+        if eco not in ('Java', 'Python'):
+            flat.append((src, eco, *vals, url))
+
+# ── Print table ───────────────────────────────────────────────────────────────
+
+HDRS = ['Source', 'Ecosystem', 'Advisories', 'OSV schema', 'Unique CVEs', 'Unique pkgs', 'Unique vers', 'Source URL']
+RIGHT = {2, 4, 5, 6}  # right-align numeric columns
+c = [max(len(HDRS[i]), max(len(str(r[i])) for r in flat)) for i in range(7)]
+print()
+hdr_line = '  ' + '  '.join(HDRS[i].rjust(c[i]) if i in RIGHT else HDRS[i].ljust(c[i]) for i in range(7)) + '  ' + HDRS[7]
+print(hdr_line)
+print('  ' + '  '.join('-'*c[i] for i in range(7)) + '  ' + '-'*40)
+prev_src = None
+for idx, r in enumerate(flat):
+    src_label = r[0] if r[0] != prev_src else ''
+    prev_src  = r[0]
+    line = '  ' + src_label.ljust(c[0]) + '  ' + r[1].ljust(c[1])
+    for i in range(2, 7):
+        line += '  ' + (str(r[i]).rjust(c[i]) if i in RIGHT else str(r[i]).ljust(c[i]))
+    line += '  ' + (r[7] if src_label else '')
+    print(line)
+    if src_label == '' and idx < len(flat)-1 and flat[idx+1][0] != r[0]:
+        print()
+print()
+"
 }
 
 q_count_remediations() {
@@ -144,55 +309,69 @@ else:
 
 q_map_github() {
   require_cache "cache_ok '$GITHUB_DIR'" "GitHub OSV" || return
+  local provider; provider=$(ask_provider)
   local csv; csv=$(ask_csv)
   python3 -I -c "
 import sys, json, os, csv as csvmod, glob
 from collections import defaultdict
 
+provider   = '$provider'
 GITHUB_DIR = '$GITHUB_DIR'
-rows = []
-eco_data = defaultdict(lambda: {'advs': set(), 'pkgs': set(), 'cves': set()})
+CG_DIR     = '$CHAINGUARD_DIR'
+rows       = []
+eco_data   = defaultdict(lambda: {'advs': set(), 'pkgs': set(), 'cves': set()})
 
-for fpath in sorted(glob.glob(GITHUB_DIR + '/*.json')):
+def parse_file(fpath, source_label):
     fname = os.path.basename(fpath)
     try:
         with open(fpath) as fh:
             d = json.load(fh)
     except Exception:
-        continue
-    adv_id   = d.get('id', '')
-    schema   = d.get('schema_version', '')
-    cve_list = [u for u in d.get('upstream', []) if u.startswith('CVE-')]
-    cves     = ','.join(cve_list)
+        return
+    adv_id = d.get('id', '')
+    schema = d.get('schema_version', '')
+    # Lightwell uses 'upstream', Chainguard uses 'aliases'
+    cve_list = [u for u in d.get('upstream', []) + d.get('aliases', []) if u.startswith('CVE-')]
+    cves = ','.join(sorted(set(cve_list)))
     for a in d.get('affected', []):
         eco = a.get('package', {}).get('ecosystem', '')
         pkg = a.get('package', {}).get('name', '')
         ver = ([e['fixed'] for r in a.get('ranges', []) for e in r.get('events', []) if 'fixed' in e] + [''])[0]
         ver = ver or (a.get('database_specific', {}).get('lightwell', {}).get('remediated_version', ''))
-        rows.append([fname, adv_id, schema, eco, pkg, ver, cves])
+        rows.append([source_label, fname, adv_id, schema, eco, pkg, ver, cves])
         family = eco.removeprefix('Red Hat Lightwell:')
         eco_data[family]['advs'].add(adv_id)
         eco_data[family]['pkgs'].add(pkg)
         eco_data[family]['cves'].update(cve_list)
 
-rows.sort(key=lambda x: (x[3], x[4], x[5]))
+if provider in ('lightwell', 'both'):
+    for f in sorted(glob.glob(GITHUB_DIR + '/*.json')):
+        parse_file(f, 'Lightwell')
+if provider in ('chainguard', 'both'):
+    for f in sorted(glob.glob(CG_DIR + '/*.json')):
+        parse_file(f, 'Chainguard')
+
+rows.sort(key=lambda x: (x[0], x[4], x[5], x[6]))
 output_csv = '$csv' == '1'
 
 if not rows:
-    print('No data.')
+    print('  No data. Run sync-cache.sh to populate cache.')
     sys.exit(0)
 
-HDRS = ['File', 'Advisory ID', 'OSV Schema Version', 'Ecosystem', 'Package', 'Remediated version', 'CVEs']
+show_provider = provider == 'both'
+HDRS = (['Provider'] if show_provider else []) + ['File', 'Advisory ID', 'OSV Schema Version', 'Ecosystem', 'Package', 'Remediated version', 'CVEs']
+data_rows = [([r[0]] if show_provider else []) + r[1:] for r in rows]
+
 if output_csv:
     w = csvmod.writer(sys.stdout)
     w.writerow(HDRS)
-    for r in rows: w.writerow(r[:7])
+    for r in data_rows: w.writerow(r)
 else:
-    c = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(HDRS)]
-    def fmt(*v): return '  ' + '  '.join(f'{v[i]:<{c[i]}}' for i in range(len(c)-1)) + f'  {v[-1]}'
+    c = [max(len(h), max(len(str(r[i])) for r in data_rows)) for i, h in enumerate(HDRS)]
+    def fmt(*v): return '  ' + '  '.join(f'{str(v[i]):<{c[i]}}' for i in range(len(c)-1)) + f'  {v[-1]}'
     print(fmt(*HDRS))
     print(fmt(*['-'*x for x in c]))
-    for r in rows: print(fmt(*r[:7]))
+    for r in data_rows: print(fmt(*r))
     print()
     for fam in sorted(eco_data):
         ed = eco_data[fam]
@@ -354,7 +533,6 @@ def show_section(entries, cols, hdrs, eco_label):
             print('    ' + lbl.ljust(28) + '  ' + str(missing))
         print()
 
-
 all_entries = data['entries']
 if eco in ('java', 'both'):
     show_section([e for e in all_entries if e.get('ecosystem','java')=='java'], JAVA_COLS, JAVA_HDRS, 'Java')
@@ -427,6 +605,137 @@ else:
 " | save_output "$csv"
 }
 
+q_api_packages() {
+  if [[ -z "${TOKEN:-}" ]]; then
+    echo "  No TOKEN set. Run: export TOKEN=\$(lw_token)" >&2
+    return
+  fi
+
+  # Validate token before asking any questions
+  local _http_code
+  _http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer $TOKEN" \
+    'https://console.redhat.com/api/lightwell/v0.1/packages?limit=1')
+  case "$_http_code" in
+    200) ;;
+    401) echo "  Token expired (HTTP 401). Refresh with: export TOKEN=\$(lw_token)" >&2; return ;;
+    403) echo "  Access denied (HTTP 403). Check your Red Hat account permissions." >&2; return ;;
+    *)   echo "  API unreachable (HTTP $_http_code). Check your connection." >&2; return ;;
+  esac
+
+  local csv; csv=$(ask_csv)
+  local outfile=""
+  if [[ "$csv" == "1" ]]; then
+    read -rp "Filename (without extension): " _fn < /dev/tty
+    outfile="${_fn:-lightwell-packages}.csv"
+  fi
+  export outfile
+  python3 -I -c "
+import json, os, sys, urllib.request, urllib.error, csv as csvmod
+
+TOKEN      = os.environ.get('TOKEN', '')
+BASE       = 'https://console.redhat.com/api/lightwell/v0.1/packages'
+headers    = {'Authorization': f'Bearer {TOKEN}'}
+OUTPUT_CSV = '$csv' == '1'
+OUTFILE    = os.environ.get('outfile', '')
+
+def api_get(params, limit=1, offset=0):
+    p = dict(params)
+    p['limit'] = limit; p['offset'] = offset
+    qs  = '&'.join(f'{k}={v}' for k, v in p.items())
+    req = urllib.request.Request(f'{BASE}?{qs}', headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f'  API error: HTTP {e.code} {e.reason}\n')
+        return None
+    except Exception as e:
+        sys.stderr.write(f'  API error: {e}\n')
+        return None
+
+def fetch_count(params):
+    d = api_get(params, limit=1)
+    return d['meta']['count'] if d else '?'
+
+def fetch_all(eco, level):
+    results, limit, offset, total = [], 100, 0, None
+    while True:
+        d = api_get({'ecosystem': eco, 'security_level': level}, limit=limit, offset=offset)
+        if d is None: break
+        if total is None: total = d['meta']['count']
+        results.extend(d['data'])
+        offset += limit
+        sys.stderr.write(f'\r  [{eco}/{level}] {len(results)}/{total}   ')
+        if offset >= total: break
+    sys.stderr.write('\n')
+    return results
+
+# ── Summary counts ────────────────────────────────────────────────────────────
+
+sys.stderr.write('  Fetching counts from Lightwell API...\n')
+
+COMBOS = [
+    ('Java',   'maven',  'remediated'),
+    ('Java',   'maven',  'validated'),
+    ('Python', 'python', 'remediated'),
+    ('Python', 'python', 'validated'),
+]
+counts      = {(lbl, lvl): fetch_count({'ecosystem': eco, 'security_level': lvl}) for lbl, eco, lvl in COMBOS}
+total_count = fetch_count({})
+
+# ── Print summary table ───────────────────────────────────────────────────────
+
+ROWS = [(lbl, lvl.capitalize(), str(counts[(lbl, lvl)])) for lbl, _, lvl in COMBOS]
+c0   = max(len('Ecosystem'),      max(len(r[0]) for r in ROWS))
+c1   = max(len('Security level'), max(len(r[1]) for r in ROWS))
+c2   = max(len('Packages'),       max(len(r[2]) for r in ROWS), len(str(total_count)))
+
+def fmt(a, b, c): return f'  {a:<{c0}}  {b:<{c1}}  {c:>{c2}}'
+
+print()
+print(fmt('Ecosystem', 'Security level', 'Packages'))
+print(fmt('-'*c0, '-'*c1, '-'*c2))
+prev = None
+for lbl, _, lvl in COMBOS:
+    label = lbl if lbl != prev else ''
+    prev  = lbl
+    print(fmt(label, lvl.capitalize(), str(counts[(lbl, lvl)])))
+print('  ' + '-' * (c0 + c1 + c2 + 6))
+print(fmt('Total', '', str(total_count)))
+print()
+
+if not OUTPUT_CSV:
+    sys.exit(0)
+
+# ── Fetch all and write CSV ───────────────────────────────────────────────────
+
+sys.stderr.write('  Fetching all packages for CSV export...\n')
+all_rows = []
+for lbl, eco, lvl in COMBOS:
+    for p in fetch_all(eco, lvl):
+        name       = p.get('name', '')
+        group      = p.get('group', '')
+        repository = p.get('repository', '')
+        versions   = ', '.join(p.get('versions', []))
+        lr         = p.get('latest_releases', [])
+        latest     = lr[0].get('version',    '') if lr else ''
+        release    = lr[0].get('release',    '') if lr else ''
+        created_at = lr[0].get('created_at', '') if lr else ''
+        all_rows.append((lbl, lvl.capitalize(), group, name, repository, versions, latest, release, created_at))
+
+all_rows.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+
+with open(OUTFILE, 'w', newline='') as f:
+    w = csvmod.writer(f)
+    w.writerow(['Ecosystem', 'Security Level', 'Group', 'Package', 'Repository',
+                'Versions', 'Latest Version', 'Latest Release', 'Published At'])
+    w.writerows(all_rows)
+
+print(f'  {len(all_rows)} packages saved to {OUTFILE}')
+"
+}
+
 # ── Main menu loop ────────────────────────────────────────────────────────────
 
 while true; do
@@ -480,6 +789,10 @@ except: print('none')
   printf "  ${BOLD}6) Check artifact completeness${NC}\n"
   printf "  ${BOLD}7) List packages added in time window${NC}\n"
   echo ""
+  printf "  ${GREEN}Lightwell Network API  (live — requires \$TOKEN)${NC}\n"
+  echo ""
+  printf "  ${BOLD}8) Extract packages — remediated & validated summary + CSV${NC}\n"
+  echo ""
   printf "  ${BOLD}0) Exit${NC}\n"
   echo ""
   read -rp "Choice: " _choice
@@ -492,6 +805,7 @@ except: print('none')
     5) q_list_packages ;;
     6) q_check_artifacts ;;
     7) q_list_added ;;
+    8) q_api_packages ;;
     0) echo "Bye."; exit 0 ;;
     *) echo "  Invalid choice." ;;
   esac
